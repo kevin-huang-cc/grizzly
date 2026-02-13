@@ -1,305 +1,269 @@
 package grizzly
 
-import (
-	"fmt"
-	"reflect"
-)
+import "strconv"
 
-type CompareFunc[T any] func(a, b T) int
-
-type Column[T any] struct {
-	name    string
-	data    []T
-	valid   []uint64
-	compare CompareFunc[T]
-	dtype   DType
+type Column interface {
+	Name() string
+	DType() DType
+	Len() int
+	IsNull(i int) bool
+	ValueString(i int) string
+	Filter(mask []bool) Column
+	Take(order []int) Column
+	Less(i, j int) bool
 }
 
-func NewColumn[T any](name string, data []T) *Column[T] {
-	return NewColumnWithComparator(name, data, nil)
+type Int64Column struct {
+	name  string
+	data  []int64
+	valid bitmap
 }
 
-func NewColumnWithComparator[T any](name string, data []T, compare CompareFunc[T]) *Column[T] {
-	col := &Column[T]{
-		name:    name,
-		data:    append([]T(nil), data...),
-		valid:   makeFullValidity(len(data)),
-		compare: compare,
+type Float64Column struct {
+	name  string
+	data  []float64
+	valid bitmap
+}
+
+type BoolColumn struct {
+	name  string
+	data  []bool
+	valid bitmap
+}
+
+type Utf8Column struct {
+	name  string
+	data  []string
+	valid bitmap
+}
+
+func NewInt64Column(name string, data []int64, valid []bool) *Int64Column {
+	v := bitmap{}
+	if valid == nil {
+		v = newBitmap(len(data), true)
+	} else {
+		v = newBitmapFromBools(valid)
 	}
-	col.initTypeAndComparator()
-	return col
+	return &Int64Column{name: name, data: append([]int64(nil), data...), valid: v}
 }
 
-func NewNullableColumn[T any](name string, data []T, validMask []bool) (*Column[T], error) {
-	return NewNullableColumnWithComparator(name, data, validMask, nil)
-}
-
-func NewNullableColumnWithComparator[T any](name string, data []T, validMask []bool, compare CompareFunc[T]) (*Column[T], error) {
-	if len(data) != len(validMask) {
-		return nil, fmt.Errorf("column %q: data and valid mask lengths differ", name)
+func NewFloat64Column(name string, data []float64, valid []bool) *Float64Column {
+	v := bitmap{}
+	if valid == nil {
+		v = newBitmap(len(data), true)
+	} else {
+		v = newBitmapFromBools(valid)
 	}
-	col := &Column[T]{
-		name:    name,
-		data:    append([]T(nil), data...),
-		valid:   makeValidityFromMask(validMask),
-		compare: compare,
+	return &Float64Column{name: name, data: append([]float64(nil), data...), valid: v}
+}
+
+func NewBoolColumn(name string, data []bool, valid []bool) *BoolColumn {
+	v := bitmap{}
+	if valid == nil {
+		v = newBitmap(len(data), true)
+	} else {
+		v = newBitmapFromBools(valid)
 	}
-	col.initTypeAndComparator()
-	return col, nil
+	return &BoolColumn{name: name, data: append([]bool(nil), data...), valid: v}
 }
 
-func (c *Column[T]) initTypeAndComparator() {
-	c.dtype = inferColumnDType(c.data)
-	if c.compare == nil {
-		c.compare = defaultCompareFunc[T]()
+func NewUtf8Column(name string, data []string, valid []bool) *Utf8Column {
+	v := bitmap{}
+	if valid == nil {
+		v = newBitmap(len(data), true)
+	} else {
+		v = newBitmapFromBools(valid)
 	}
+	return &Utf8Column{name: name, data: append([]string(nil), data...), valid: v}
 }
 
-func (c *Column[T]) Name() string {
-	return c.name
+func newInt64ColumnOwned(name string, data []int64, valid bitmap) *Int64Column {
+	return &Int64Column{name: name, data: data, valid: valid}
 }
 
-func (c *Column[T]) Len() int {
-	return len(c.data)
+func newFloat64ColumnOwned(name string, data []float64, valid bitmap) *Float64Column {
+	return &Float64Column{name: name, data: data, valid: valid}
 }
 
-func (c *Column[T]) DType() DType {
-	return c.dtype
+func newBoolColumnOwned(name string, data []bool, valid bitmap) *BoolColumn {
+	return &BoolColumn{name: name, data: data, valid: valid}
 }
 
-func (c *Column[T]) SupportsSort() bool {
-	return c.compare != nil
+func newUtf8ColumnOwned(name string, data []string, valid bitmap) *Utf8Column {
+	return &Utf8Column{name: name, data: data, valid: valid}
 }
 
-func (c *Column[T]) ValidAt(row int) bool {
-	return bitGet(c.valid, row)
-}
-
-func (c *Column[T]) ValueAt(row int) any {
-	if !c.ValidAt(row) {
-		return nil
+func (c *Int64Column) Name() string       { return c.name }
+func (c *Int64Column) DType() DType       { return DTypeInt64 }
+func (c *Int64Column) Len() int           { return len(c.data) }
+func (c *Int64Column) IsNull(i int) bool  { return !c.valid.get(i) }
+func (c *Int64Column) Value(i int) int64  { return c.data[i] }
+func (c *Int64Column) Less(i, j int) bool { return c.data[i] < c.data[j] }
+func (c *Int64Column) ValueString(i int) string {
+	if c.IsNull(i) {
+		return ""
 	}
-	return c.data[row]
+	return strconv.FormatInt(c.data[i], 10)
 }
-
-func (c *Column[T]) CompareRows(i, j int) int {
-	if c.compare == nil {
-		return 0
-	}
-	vi := c.ValidAt(i)
-	vj := c.ValidAt(j)
-	if !vi && !vj {
-		return 0
-	}
-	if !vi {
-		return 1
-	}
-	if !vj {
-		return -1
-	}
-	return c.compare(c.data[i], c.data[j])
-}
-
-func (c *Column[T]) Take(order []int) Series {
-	out := make([]T, len(order))
-	valid := make([]bool, len(order))
-	for i, row := range order {
-		out[i] = c.data[row]
-		valid[i] = c.ValidAt(row)
-	}
-	next, _ := NewNullableColumnWithComparator(c.name, out, valid, c.compare)
-	return next
-}
-
-func (c *Column[T]) Filter(mask []bool) Series {
-	if len(mask) != c.Len() {
-		panic("mask length mismatch")
-	}
-	out := make([]T, 0, c.Len())
-	valid := make([]bool, 0, c.Len())
-	for i := range c.data {
+func (c *Int64Column) Filter(mask []bool) Column {
+	n := 0
+	for i := range mask {
 		if mask[i] {
-			out = append(out, c.data[i])
-			valid = append(valid, c.ValidAt(i))
+			n++
 		}
 	}
-	next, _ := NewNullableColumnWithComparator(c.name, out, valid, c.compare)
-	return next
+	out := make([]int64, n)
+	valid := bitmapBuilder{}
+	idx := 0
+	for i := range c.data {
+		if !mask[i] {
+			continue
+		}
+		out[idx] = c.data[i]
+		valid.Append(!c.IsNull(i))
+		idx++
+	}
+	return newInt64ColumnOwned(c.name, out, valid.Build())
+}
+func (c *Int64Column) Take(order []int) Column {
+	out := make([]int64, len(order))
+	valid := bitmapBuilder{}
+	for i := range order {
+		row := order[i]
+		out[i] = c.data[row]
+		valid.Append(!c.IsNull(row))
+	}
+	return newInt64ColumnOwned(c.name, out, valid.Build())
 }
 
-func inferColumnDType[T any](data []T) DType {
-	for _, v := range data {
-		dt := dtypeFromValue(v)
-		if dt != DTypeUnknown {
-			return dt
-		}
-		t := reflect.TypeOf(v)
-		if t != nil {
-			return DType(t.String())
+func (c *Float64Column) Name() string        { return c.name }
+func (c *Float64Column) DType() DType        { return DTypeFloat64 }
+func (c *Float64Column) Len() int            { return len(c.data) }
+func (c *Float64Column) IsNull(i int) bool   { return !c.valid.get(i) }
+func (c *Float64Column) Value(i int) float64 { return c.data[i] }
+func (c *Float64Column) Less(i, j int) bool  { return c.data[i] < c.data[j] }
+func (c *Float64Column) ValueString(i int) string {
+	if c.IsNull(i) {
+		return ""
+	}
+	return strconv.FormatFloat(c.data[i], 'g', -1, 64)
+}
+func (c *Float64Column) Filter(mask []bool) Column {
+	n := 0
+	for i := range mask {
+		if mask[i] {
+			n++
 		}
 	}
-	var z T
-	if t := reflect.TypeOf(z); t != nil {
-		dt := dtypeFromValue(z)
-		if dt != DTypeUnknown {
-			return dt
+	out := make([]float64, n)
+	valid := bitmapBuilder{}
+	idx := 0
+	for i := range c.data {
+		if !mask[i] {
+			continue
 		}
-		return DType(t.String())
+		out[idx] = c.data[i]
+		valid.Append(!c.IsNull(i))
+		idx++
 	}
-	return DTypeUnknown
+	return newFloat64ColumnOwned(c.name, out, valid.Build())
+}
+func (c *Float64Column) Take(order []int) Column {
+	out := make([]float64, len(order))
+	valid := bitmapBuilder{}
+	for i := range order {
+		row := order[i]
+		out[i] = c.data[row]
+		valid.Append(!c.IsNull(row))
+	}
+	return newFloat64ColumnOwned(c.name, out, valid.Build())
 }
 
-func defaultCompareFunc[T any]() CompareFunc[T] {
-	var z T
-	t := reflect.TypeOf(z)
-	if t == nil {
-		return nil
+func (c *BoolColumn) Name() string       { return c.name }
+func (c *BoolColumn) DType() DType       { return DTypeBool }
+func (c *BoolColumn) Len() int           { return len(c.data) }
+func (c *BoolColumn) IsNull(i int) bool  { return !c.valid.get(i) }
+func (c *BoolColumn) Value(i int) bool   { return c.data[i] }
+func (c *BoolColumn) Less(i, j int) bool { return !c.data[i] && c.data[j] }
+func (c *BoolColumn) ValueString(i int) string {
+	if c.IsNull(i) {
+		return ""
 	}
-	switch t.Kind() {
-	case reflect.String,
-		reflect.Bool,
-		reflect.Int,
-		reflect.Int8,
-		reflect.Int16,
-		reflect.Int32,
-		reflect.Int64,
-		reflect.Uint,
-		reflect.Uint8,
-		reflect.Uint16,
-		reflect.Uint32,
-		reflect.Uint64,
-		reflect.Float32,
-		reflect.Float64:
-	default:
-		return nil
+	if c.data[i] {
+		return "true"
 	}
-	return func(a, b T) int {
-		res, ok := compareDynamicValues(any(a), any(b))
-		if !ok {
-			return 0
+	return "false"
+}
+func (c *BoolColumn) Filter(mask []bool) Column {
+	n := 0
+	for i := range mask {
+		if mask[i] {
+			n++
 		}
-		return res
 	}
+	out := make([]bool, n)
+	valid := bitmapBuilder{}
+	idx := 0
+	for i := range c.data {
+		if !mask[i] {
+			continue
+		}
+		out[idx] = c.data[i]
+		valid.Append(!c.IsNull(i))
+		idx++
+	}
+	return newBoolColumnOwned(c.name, out, valid.Build())
+}
+func (c *BoolColumn) Take(order []int) Column {
+	out := make([]bool, len(order))
+	valid := bitmapBuilder{}
+	for i := range order {
+		row := order[i]
+		out[i] = c.data[row]
+		valid.Append(!c.IsNull(row))
+	}
+	return newBoolColumnOwned(c.name, out, valid.Build())
 }
 
-func compareDynamicValues(a, b any) (int, bool) {
-	if a == nil && b == nil {
-		return 0, true
+func (c *Utf8Column) Name() string       { return c.name }
+func (c *Utf8Column) DType() DType       { return DTypeUtf8 }
+func (c *Utf8Column) Len() int           { return len(c.data) }
+func (c *Utf8Column) IsNull(i int) bool  { return !c.valid.get(i) }
+func (c *Utf8Column) Value(i int) string { return c.data[i] }
+func (c *Utf8Column) Less(i, j int) bool { return c.data[i] < c.data[j] }
+func (c *Utf8Column) ValueString(i int) string {
+	if c.IsNull(i) {
+		return ""
 	}
-	if a == nil {
-		return -1, true
-	}
-	if b == nil {
-		return 1, true
-	}
-	switch av := a.(type) {
-	case string:
-		bv, ok := b.(string)
-		if !ok {
-			return 0, false
-		}
-		if av < bv {
-			return -1, true
-		}
-		if av > bv {
-			return 1, true
-		}
-		return 0, true
-	case bool:
-		bv, ok := b.(bool)
-		if !ok {
-			return 0, false
-		}
-		if av == bv {
-			return 0, true
-		}
-		if !av && bv {
-			return -1, true
-		}
-		return 1, true
-	case int:
-		bv, ok := b.(int)
-		if !ok {
-			return 0, false
-		}
-		return compareOrdered(av, bv), true
-	case int8:
-		bv, ok := b.(int8)
-		if !ok {
-			return 0, false
-		}
-		return compareOrdered(av, bv), true
-	case int16:
-		bv, ok := b.(int16)
-		if !ok {
-			return 0, false
-		}
-		return compareOrdered(av, bv), true
-	case int32:
-		bv, ok := b.(int32)
-		if !ok {
-			return 0, false
-		}
-		return compareOrdered(av, bv), true
-	case int64:
-		bv, ok := b.(int64)
-		if !ok {
-			return 0, false
-		}
-		return compareOrdered(av, bv), true
-	case uint:
-		bv, ok := b.(uint)
-		if !ok {
-			return 0, false
-		}
-		return compareOrdered(av, bv), true
-	case uint8:
-		bv, ok := b.(uint8)
-		if !ok {
-			return 0, false
-		}
-		return compareOrdered(av, bv), true
-	case uint16:
-		bv, ok := b.(uint16)
-		if !ok {
-			return 0, false
-		}
-		return compareOrdered(av, bv), true
-	case uint32:
-		bv, ok := b.(uint32)
-		if !ok {
-			return 0, false
-		}
-		return compareOrdered(av, bv), true
-	case uint64:
-		bv, ok := b.(uint64)
-		if !ok {
-			return 0, false
-		}
-		return compareOrdered(av, bv), true
-	case float32:
-		bv, ok := b.(float32)
-		if !ok {
-			return 0, false
-		}
-		return compareOrdered(av, bv), true
-	case float64:
-		bv, ok := b.(float64)
-		if !ok {
-			return 0, false
-		}
-		return compareOrdered(av, bv), true
-	default:
-		return 0, false
-	}
+	return c.data[i]
 }
-
-func compareOrdered[T ~int | ~int8 | ~int16 | ~int32 | ~int64 | ~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~float32 | ~float64](a, b T) int {
-	if a < b {
-		return -1
+func (c *Utf8Column) Filter(mask []bool) Column {
+	n := 0
+	for i := range mask {
+		if mask[i] {
+			n++
+		}
 	}
-	if a > b {
-		return 1
+	out := make([]string, n)
+	valid := bitmapBuilder{}
+	idx := 0
+	for i := range c.data {
+		if !mask[i] {
+			continue
+		}
+		out[idx] = c.data[i]
+		valid.Append(!c.IsNull(i))
+		idx++
 	}
-	return 0
+	return newUtf8ColumnOwned(c.name, out, valid.Build())
+}
+func (c *Utf8Column) Take(order []int) Column {
+	out := make([]string, len(order))
+	valid := bitmapBuilder{}
+	for i := range order {
+		row := order[i]
+		out[i] = c.data[row]
+		valid.Append(!c.IsNull(row))
+	}
+	return newUtf8ColumnOwned(c.name, out, valid.Build())
 }

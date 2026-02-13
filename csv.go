@@ -4,192 +4,79 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 )
 
-type CSVWriteOptions struct {
-	Comma     rune
-	NullValue string
-	NoHeader  bool
+const csvTypeSampleRows = 8192
+
+type typedBuilder interface {
+	Append(raw string, row int) error
+	Build(name string) Column
 }
 
-type CSVReadOptions struct {
-	Comma     rune
-	NullValue string
-	NoHeader  bool
-	Schema    map[string]DType
+type int64Builder struct {
+	data  []int64
+	valid bitmapBuilder
+	nulls map[string]struct{}
 }
 
-func (f *Frame) WriteCSV(w io.Writer, opts CSVWriteOptions) error {
-	if f == nil {
-		return fmt.Errorf("frame is nil")
-	}
-	writer := csv.NewWriter(w)
-	if opts.Comma != 0 {
-		writer.Comma = opts.Comma
-	}
-	if !opts.NoHeader {
-		if err := writer.Write(f.columnIDs); err != nil {
-			return err
-		}
-	}
-	for _, row := range f.order {
-		record := make([]string, len(f.columnIDs))
-		for i, name := range f.columnIDs {
-			col := f.columns[name]
-			if !col.ValidAt(row) {
-				record[i] = opts.NullValue
-				continue
-			}
-			record[i] = fmt.Sprint(col.ValueAt(row))
-		}
-		if err := writer.Write(record); err != nil {
-			return err
-		}
-	}
-	writer.Flush()
-	return writer.Error()
+type float64Builder struct {
+	data  []float64
+	valid bitmapBuilder
+	nulls map[string]struct{}
 }
 
-func (f *Frame) MarshalCSV(opts CSVWriteOptions) (string, error) {
-	var b strings.Builder
-	if err := f.WriteCSV(&b, opts); err != nil {
-		return "", err
-	}
-	return b.String(), nil
+type boolBuilder struct {
+	data  []bool
+	valid bitmapBuilder
+	nulls map[string]struct{}
 }
 
-func ReadCSV(r io.Reader, opts CSVReadOptions) (*Frame, error) {
-	reader := csv.NewReader(r)
-	if opts.Comma != 0 {
-		reader.Comma = opts.Comma
-	}
-	reader.ReuseRecord = true
+type utf8Builder struct {
+	data  []string
+	valid bitmapBuilder
+	nulls map[string]struct{}
+}
 
-	first, err := reader.Read()
-	if err == io.EOF {
-		return nil, fmt.Errorf("csv input is empty")
-	}
+func readCSV(path string, opts ScanOptions) (*DataFrame, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
 
-	var header []string
-	if opts.NoHeader {
-		width := len(first)
-		header = make([]string, width)
-		for i := range header {
-			header[i] = fmt.Sprintf("col_%d", i+1)
-		}
-	} else {
-		header = append([]string(nil), first...)
+	r := csv.NewReader(f)
+	r.ReuseRecord = true
+	if opts.Delimiter != 0 {
+		r.Comma = opts.Delimiter
 	}
 
-	if len(header) == 0 {
-		return nil, fmt.Errorf("csv must contain at least one column")
-	}
-	width := len(header)
-	seen := make(map[string]struct{}, width)
-	for i, name := range header {
-		if strings.TrimSpace(name) == "" {
-			return nil, fmt.Errorf("column %d has empty name", i)
-		}
-		if _, ok := seen[name]; ok {
-			return nil, fmt.Errorf("duplicate column %q", name)
-		}
-		seen[name] = struct{}{}
-	}
-
-	if hasFullSchema(header, opts.Schema) {
-		return readCSVSchemaFast(reader, first, header, opts)
-	}
-
-	columnValues := make([][]string, width)
-	for i := range columnValues {
-		columnValues[i] = make([]string, 0, 16384)
-	}
-
-	if opts.NoHeader {
-		for j := range first {
-			columnValues[j] = append(columnValues[j], first[j])
-		}
-	}
-
-	rowNum := 1
-	if !opts.NoHeader {
-		rowNum = 2
-	}
-	for {
-		rec, err := reader.Read()
+	header, err := r.Read()
+	if err != nil {
 		if err == io.EOF {
-			break
+			return nil, fmt.Errorf("empty csv")
 		}
-		if err != nil {
-			return nil, err
-		}
-		if len(rec) != width {
-			return nil, fmt.Errorf("row %d has %d fields; expected %d", rowNum, len(rec), width)
-		}
-		for j := range rec {
-			columnValues[j] = append(columnValues[j], rec[j])
-		}
-		rowNum++
+		return nil, err
+	}
+	if len(header) == 0 {
+		return nil, fmt.Errorf("empty csv header")
+	}
+	header = append([]string(nil), header...)
+
+	nulls := make(map[string]struct{}, len(opts.NullValues))
+	for i := range opts.NullValues {
+		nulls[opts.NullValues[i]] = struct{}{}
 	}
 
-	cols := make([]Series, 0, width)
-	for i, name := range header {
-		dtype := DTypeUnknown
-		if opts.Schema != nil {
-			dtype = normalizeDType(opts.Schema[name])
-		}
-		if dtype == DTypeUnknown {
-			dtype = inferCSVDType(columnValues[i], opts.NullValue)
-		}
-		col, err := parseCSVColumn(name, dtype, columnValues[i], opts.NullValue)
-		if err != nil {
-			return nil, err
-		}
-		cols = append(cols, col)
+	samples := make([][]string, len(header))
+	for i := range samples {
+		samples[i] = make([]string, 0, csvTypeSampleRows)
 	}
-
-	return NewFrame(cols...)
-}
-
-func hasFullSchema(header []string, schema map[string]DType) bool {
-	if schema == nil {
-		return false
-	}
-	for _, name := range header {
-		if normalizeDType(schema[name]) == DTypeUnknown {
-			return false
-		}
-	}
-	return true
-}
-
-func readCSVSchemaFast(reader *csv.Reader, first []string, header []string, opts CSVReadOptions) (*Frame, error) {
-	builders := make([]csvColumnBuilder, len(header))
-	for i, name := range header {
-		b, err := newCSVColumnBuilder(normalizeDType(opts.Schema[name]), opts.NullValue)
-		if err != nil {
-			return nil, fmt.Errorf("column %q: %w", name, err)
-		}
-		builders[i] = b
-	}
-
-	rowNum := 1
-	if opts.NoHeader {
-		if err := appendCSVRecord(builders, first, rowNum); err != nil {
-			return nil, err
-		}
-		rowNum++
-	} else {
-		rowNum = 2
-	}
-
-	for {
-		rec, err := reader.Read()
+	records := make([][]string, 0, csvTypeSampleRows)
+	for len(records) < csvTypeSampleRows {
+		rec, err := r.Read()
 		if err == io.EOF {
 			break
 		}
@@ -197,52 +84,153 @@ func readCSVSchemaFast(reader *csv.Reader, first []string, header []string, opts
 			return nil, err
 		}
 		if len(rec) != len(header) {
-			return nil, fmt.Errorf("row %d has %d fields; expected %d", rowNum, len(rec), len(header))
+			return nil, fmt.Errorf("csv row has %d columns expected %d", len(rec), len(header))
 		}
-		if err := appendCSVRecord(builders, rec, rowNum); err != nil {
+		cp := append([]string(nil), rec...)
+		records = append(records, cp)
+		for i := range cp {
+			samples[i] = append(samples[i], cp[i])
+		}
+	}
+
+	builders := make([]typedBuilder, len(header))
+	for i := range header {
+		builders[i] = newBuilder(inferType(samples[i], nulls), nulls)
+	}
+
+	row := 1
+	for i := range records {
+		for j := range records[i] {
+			if err := builders[j].Append(records[i][j], row); err != nil {
+				return nil, err
+			}
+		}
+		row++
+	}
+
+	for {
+		rec, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
 			return nil, err
 		}
-		rowNum++
+		if len(rec) != len(header) {
+			return nil, fmt.Errorf("csv row has %d columns expected %d", len(rec), len(header))
+		}
+		for i := range rec {
+			if err := builders[i].Append(rec[i], row); err != nil {
+				return nil, err
+			}
+		}
+		row++
 	}
 
-	cols := make([]Series, len(header))
-	for i, name := range header {
-		cols[i] = builders[i].Finalize(name)
+	cols := make([]Column, len(header))
+	for i := range header {
+		cols[i] = builders[i].Build(header[i])
 	}
-	return NewFrame(cols...)
+	return NewDataFrame(cols...)
 }
 
-func appendCSVRecord(builders []csvColumnBuilder, rec []string, rowNum int) error {
-	for i := range rec {
-		if err := builders[i].Append(rec[i], rowNum); err != nil {
-			return fmt.Errorf("column %d row %d: %w", i+1, rowNum, err)
-		}
+func newBuilder(dtype DType, nulls map[string]struct{}) typedBuilder {
+	switch dtype {
+	case DTypeInt64:
+		return &int64Builder{data: make([]int64, 0, 16384), nulls: nulls}
+	case DTypeFloat64:
+		return &float64Builder{data: make([]float64, 0, 16384), nulls: nulls}
+	case DTypeBool:
+		return &boolBuilder{data: make([]bool, 0, 16384), nulls: nulls}
+	default:
+		return &utf8Builder{data: make([]string, 0, 16384), nulls: nulls}
 	}
+}
+
+func (b *int64Builder) Append(raw string, row int) error {
+	b.data = append(b.data, 0)
+	if _, ok := b.nulls[raw]; ok {
+		b.valid.Append(false)
+		return nil
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return fmt.Errorf("row %d parse int64: %w", row, err)
+	}
+	b.data[len(b.data)-1] = v
+	b.valid.Append(true)
 	return nil
 }
-
-func UnmarshalCSV(data string, opts CSVReadOptions) (*Frame, error) {
-	return ReadCSV(strings.NewReader(data), opts)
+func (b *int64Builder) Build(name string) Column {
+	return newInt64ColumnOwned(name, b.data, b.valid.Build())
 }
 
-func inferCSVDType(values []string, nullValue string) DType {
+func (b *float64Builder) Append(raw string, row int) error {
+	b.data = append(b.data, 0)
+	if _, ok := b.nulls[raw]; ok {
+		b.valid.Append(false)
+		return nil
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return fmt.Errorf("row %d parse float64: %w", row, err)
+	}
+	b.data[len(b.data)-1] = v
+	b.valid.Append(true)
+	return nil
+}
+func (b *float64Builder) Build(name string) Column {
+	return newFloat64ColumnOwned(name, b.data, b.valid.Build())
+}
+
+func (b *boolBuilder) Append(raw string, row int) error {
+	b.data = append(b.data, false)
+	if _, ok := b.nulls[raw]; ok {
+		b.valid.Append(false)
+		return nil
+	}
+	v, err := strconv.ParseBool(strings.ToLower(raw))
+	if err != nil {
+		return fmt.Errorf("row %d parse bool: %w", row, err)
+	}
+	b.data[len(b.data)-1] = v
+	b.valid.Append(true)
+	return nil
+}
+func (b *boolBuilder) Build(name string) Column {
+	return newBoolColumnOwned(name, b.data, b.valid.Build())
+}
+
+func (b *utf8Builder) Append(raw string, _ int) error {
+	b.data = append(b.data, raw)
+	_, isNull := b.nulls[raw]
+	b.valid.Append(!isNull)
+	return nil
+}
+func (b *utf8Builder) Build(name string) Column {
+	return newUtf8ColumnOwned(name, b.data, b.valid.Build())
+}
+
+func inferType(values []string, nullSet map[string]struct{}) DType {
 	allInt := true
 	allFloat := true
-	hasNonNull := false
-	for _, raw := range values {
-		if raw == nullValue {
+	allBool := true
+	for i := range values {
+		if _, ok := nullSet[values[i]]; ok {
 			continue
 		}
-		hasNonNull = true
-		if _, err := strconv.ParseInt(raw, 10, 64); err != nil {
+		if _, err := strconv.ParseInt(values[i], 10, 64); err != nil {
 			allInt = false
 		}
-		if _, err := strconv.ParseFloat(raw, 64); err != nil {
+		if _, err := strconv.ParseFloat(values[i], 64); err != nil {
 			allFloat = false
 		}
-	}
-	if !hasNonNull {
-		return DTypeString
+		if _, err := strconv.ParseBool(strings.ToLower(values[i])); err != nil {
+			allBool = false
+		}
+		if !allInt && !allFloat && !allBool {
+			return DTypeUtf8
+		}
 	}
 	if allInt {
 		return DTypeInt64
@@ -250,199 +238,8 @@ func inferCSVDType(values []string, nullValue string) DType {
 	if allFloat {
 		return DTypeFloat64
 	}
-	return DTypeString
-}
-
-func parseCSVColumn(name string, dtype DType, values []string, nullValue string) (Series, error) {
-	switch normalizeDType(dtype) {
-	case DTypeString:
-		return parseCSVTypedColumn(name, values, nullValue, func(raw string) (string, error) {
-			return raw, nil
-		})
-	case DTypeInt:
-		return parseCSVTypedColumn(name, values, nullValue, func(raw string) (int, error) {
-			v, err := strconv.ParseInt(raw, 10, strconv.IntSize)
-			return int(v), err
-		})
-	case DTypeInt8:
-		return parseCSVTypedColumn(name, values, nullValue, func(raw string) (int8, error) {
-			v, err := strconv.ParseInt(raw, 10, 8)
-			return int8(v), err
-		})
-	case DTypeInt16:
-		return parseCSVTypedColumn(name, values, nullValue, func(raw string) (int16, error) {
-			v, err := strconv.ParseInt(raw, 10, 16)
-			return int16(v), err
-		})
-	case DTypeInt32:
-		return parseCSVTypedColumn(name, values, nullValue, func(raw string) (int32, error) {
-			v, err := strconv.ParseInt(raw, 10, 32)
-			return int32(v), err
-		})
-	case DTypeInt64:
-		return parseCSVTypedColumn(name, values, nullValue, func(raw string) (int64, error) {
-			return strconv.ParseInt(raw, 10, 64)
-		})
-	case DTypeUint:
-		return parseCSVTypedColumn(name, values, nullValue, func(raw string) (uint, error) {
-			v, err := strconv.ParseUint(raw, 10, strconv.IntSize)
-			return uint(v), err
-		})
-	case DTypeUint8:
-		return parseCSVTypedColumn(name, values, nullValue, func(raw string) (uint8, error) {
-			v, err := strconv.ParseUint(raw, 10, 8)
-			return uint8(v), err
-		})
-	case DTypeUint16:
-		return parseCSVTypedColumn(name, values, nullValue, func(raw string) (uint16, error) {
-			v, err := strconv.ParseUint(raw, 10, 16)
-			return uint16(v), err
-		})
-	case DTypeUint32:
-		return parseCSVTypedColumn(name, values, nullValue, func(raw string) (uint32, error) {
-			v, err := strconv.ParseUint(raw, 10, 32)
-			return uint32(v), err
-		})
-	case DTypeUint64:
-		return parseCSVTypedColumn(name, values, nullValue, func(raw string) (uint64, error) {
-			return strconv.ParseUint(raw, 10, 64)
-		})
-	case DTypeFloat32:
-		return parseCSVTypedColumn(name, values, nullValue, func(raw string) (float32, error) {
-			v, err := strconv.ParseFloat(raw, 32)
-			return float32(v), err
-		})
-	case DTypeFloat64:
-		return parseCSVTypedColumn(name, values, nullValue, func(raw string) (float64, error) {
-			return strconv.ParseFloat(raw, 64)
-		})
-	default:
-		return nil, fmt.Errorf("column %q: unsupported dtype %q", name, dtype)
+	if allBool {
+		return DTypeBool
 	}
-}
-
-func parseCSVTypedColumn[T any](name string, values []string, nullValue string, parse func(string) (T, error)) (Series, error) {
-	data := make([]T, len(values))
-	valid := make([]uint64, (len(values)+63)/64)
-	for i, raw := range values {
-		if raw == nullValue {
-			continue
-		}
-		v, err := parse(raw)
-		if err != nil {
-			return nil, fmt.Errorf("column %q row %d: %w", name, i+1, err)
-		}
-		data[i] = v
-		bitSet(valid, i)
-	}
-	return &Column[T]{
-		name:  name,
-		data:  data,
-		valid: valid,
-	}, nil
-}
-
-type csvColumnBuilder interface {
-	Append(raw string, rowNum int) error
-	Finalize(name string) Series
-}
-
-type typedCSVBuilder[T any] struct {
-	data      []T
-	valid     []uint64
-	nullValue string
-	parse     func(string) (T, error)
-}
-
-func (b *typedCSVBuilder[T]) Append(raw string, _ int) error {
-	idx := len(b.data)
-	var zero T
-	b.data = append(b.data, zero)
-	if idx%64 == 0 {
-		b.valid = append(b.valid, 0)
-	}
-	if raw == b.nullValue {
-		return nil
-	}
-	v, err := b.parse(raw)
-	if err != nil {
-		return err
-	}
-	b.data[idx] = v
-	bitSet(b.valid, idx)
-	return nil
-}
-
-func (b *typedCSVBuilder[T]) Finalize(name string) Series {
-	return &Column[T]{
-		name:  name,
-		data:  b.data,
-		valid: b.valid,
-	}
-}
-
-func newCSVColumnBuilder(dtype DType, nullValue string) (csvColumnBuilder, error) {
-	switch normalizeDType(dtype) {
-	case DTypeString:
-		return &typedCSVBuilder[string]{nullValue: nullValue, parse: func(raw string) (string, error) { return raw, nil }}, nil
-	case DTypeInt:
-		return &typedCSVBuilder[int]{nullValue: nullValue, parse: func(raw string) (int, error) {
-			v, err := strconv.ParseInt(raw, 10, strconv.IntSize)
-			return int(v), err
-		}}, nil
-	case DTypeInt8:
-		return &typedCSVBuilder[int8]{nullValue: nullValue, parse: func(raw string) (int8, error) {
-			v, err := strconv.ParseInt(raw, 10, 8)
-			return int8(v), err
-		}}, nil
-	case DTypeInt16:
-		return &typedCSVBuilder[int16]{nullValue: nullValue, parse: func(raw string) (int16, error) {
-			v, err := strconv.ParseInt(raw, 10, 16)
-			return int16(v), err
-		}}, nil
-	case DTypeInt32:
-		return &typedCSVBuilder[int32]{nullValue: nullValue, parse: func(raw string) (int32, error) {
-			v, err := strconv.ParseInt(raw, 10, 32)
-			return int32(v), err
-		}}, nil
-	case DTypeInt64:
-		return &typedCSVBuilder[int64]{nullValue: nullValue, parse: func(raw string) (int64, error) {
-			return strconv.ParseInt(raw, 10, 64)
-		}}, nil
-	case DTypeUint:
-		return &typedCSVBuilder[uint]{nullValue: nullValue, parse: func(raw string) (uint, error) {
-			v, err := strconv.ParseUint(raw, 10, strconv.IntSize)
-			return uint(v), err
-		}}, nil
-	case DTypeUint8:
-		return &typedCSVBuilder[uint8]{nullValue: nullValue, parse: func(raw string) (uint8, error) {
-			v, err := strconv.ParseUint(raw, 10, 8)
-			return uint8(v), err
-		}}, nil
-	case DTypeUint16:
-		return &typedCSVBuilder[uint16]{nullValue: nullValue, parse: func(raw string) (uint16, error) {
-			v, err := strconv.ParseUint(raw, 10, 16)
-			return uint16(v), err
-		}}, nil
-	case DTypeUint32:
-		return &typedCSVBuilder[uint32]{nullValue: nullValue, parse: func(raw string) (uint32, error) {
-			v, err := strconv.ParseUint(raw, 10, 32)
-			return uint32(v), err
-		}}, nil
-	case DTypeUint64:
-		return &typedCSVBuilder[uint64]{nullValue: nullValue, parse: func(raw string) (uint64, error) {
-			return strconv.ParseUint(raw, 10, 64)
-		}}, nil
-	case DTypeFloat32:
-		return &typedCSVBuilder[float32]{nullValue: nullValue, parse: func(raw string) (float32, error) {
-			v, err := strconv.ParseFloat(raw, 32)
-			return float32(v), err
-		}}, nil
-	case DTypeFloat64:
-		return &typedCSVBuilder[float64]{nullValue: nullValue, parse: func(raw string) (float64, error) {
-			return strconv.ParseFloat(raw, 64)
-		}}, nil
-	default:
-		return nil, fmt.Errorf("unsupported dtype %q", dtype)
-	}
+	return DTypeUtf8
 }

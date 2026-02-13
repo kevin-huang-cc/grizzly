@@ -1,210 +1,90 @@
 package grizzly
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"strings"
+	"os"
 )
 
-type jsonFrame struct {
-	Columns []jsonColumn `json:"columns"`
-}
-
-type jsonColumn struct {
-	Name  string            `json:"name"`
-	DType DType             `json:"dtype"`
-	Data  []json.RawMessage `json:"data"`
-}
-
-func (f *Frame) MarshalJSON() ([]byte, error) {
-	if f == nil {
-		return []byte("null"), nil
-	}
-	payload := jsonFrame{Columns: make([]jsonColumn, 0, len(f.columnIDs))}
-	for _, id := range f.columnIDs {
-		col := f.columns[id]
-		out := jsonColumn{
-			Name:  id,
-			DType: col.DType(),
-			Data:  make([]json.RawMessage, len(f.order)),
-		}
-		for i, row := range f.order {
-			if !col.ValidAt(row) {
-				out.Data[i] = json.RawMessage("null")
-				continue
-			}
-			b, err := json.Marshal(col.ValueAt(row))
-			if err != nil {
-				return nil, fmt.Errorf("column %q row %d: %w", id, i, err)
-			}
-			out.Data[i] = b
-		}
-		payload.Columns = append(payload.Columns, out)
-	}
-	return json.Marshal(payload)
-}
-
-func (f *Frame) UnmarshalJSON(data []byte) error {
-	if strings.TrimSpace(string(data)) == "null" {
-		*f = Frame{}
-		return nil
-	}
-	var payload jsonFrame
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return err
-	}
-	if len(payload.Columns) == 0 {
-		return fmt.Errorf("json frame must contain at least one column")
-	}
-	cols := make([]Series, 0, len(payload.Columns))
-	rowCount := -1
-	for _, jc := range payload.Columns {
-		if rowCount == -1 {
-			rowCount = len(jc.Data)
-		} else if rowCount != len(jc.Data) {
-			return fmt.Errorf("column %q has %d rows; expected %d", jc.Name, len(jc.Data), rowCount)
-		}
-		col, err := decodeJSONColumn(jc)
-		if err != nil {
-			return err
-		}
-		cols = append(cols, col)
-	}
-	next, err := NewFrame(cols...)
+func readJSON(path string) (*DataFrame, error) {
+	b, err := os.ReadFile(path)
 	if err != nil {
-		return err
-	}
-	*f = *next
-	return nil
-}
-
-func MarshalFrameJSON(f *Frame) ([]byte, error) {
-	return json.Marshal(f)
-}
-
-func UnmarshalFrameJSON(data []byte) (*Frame, error) {
-	var f Frame
-	if err := json.Unmarshal(data, &f); err != nil {
 		return nil, err
 	}
-	return &f, nil
+	var payload any
+	if err := json.Unmarshal(b, &payload); err != nil {
+		return nil, err
+	}
+	rows, err := normalizeJSONRows(payload)
+	if err != nil {
+		return nil, err
+	}
+	return recordsToFrame(rows)
 }
 
-func decodeJSONColumn(col jsonColumn) (Series, error) {
-	if col.Name == "" {
-		return nil, fmt.Errorf("column name cannot be empty")
-	}
-	switch normalizeDType(col.DType) {
-	case DTypeString:
-		return decodeJSONTypedColumn(col.Name, col.Data, func(raw json.RawMessage) (string, error) {
-			var v string
-			err := json.Unmarshal(raw, &v)
-			return v, err
-		})
-	case DTypeInt:
-		return decodeJSONTypedColumn(col.Name, col.Data, func(raw json.RawMessage) (int, error) {
-			var v int
-			err := json.Unmarshal(raw, &v)
-			return v, err
-		})
-	case DTypeInt8:
-		return decodeJSONTypedColumn(col.Name, col.Data, func(raw json.RawMessage) (int8, error) {
-			var v int8
-			err := json.Unmarshal(raw, &v)
-			return v, err
-		})
-	case DTypeInt16:
-		return decodeJSONTypedColumn(col.Name, col.Data, func(raw json.RawMessage) (int16, error) {
-			var v int16
-			err := json.Unmarshal(raw, &v)
-			return v, err
-		})
-	case DTypeInt32:
-		return decodeJSONTypedColumn(col.Name, col.Data, func(raw json.RawMessage) (int32, error) {
-			var v int32
-			err := json.Unmarshal(raw, &v)
-			return v, err
-		})
-	case DTypeInt64:
-		return decodeJSONTypedColumn(col.Name, col.Data, func(raw json.RawMessage) (int64, error) {
-			var v int64
-			err := json.Unmarshal(raw, &v)
-			return v, err
-		})
-	case DTypeUint:
-		return decodeJSONTypedColumn(col.Name, col.Data, func(raw json.RawMessage) (uint, error) {
-			var v uint
-			err := json.Unmarshal(raw, &v)
-			return v, err
-		})
-	case DTypeUint8:
-		return decodeJSONTypedColumn(col.Name, col.Data, func(raw json.RawMessage) (uint8, error) {
-			var v uint8
-			err := json.Unmarshal(raw, &v)
-			return v, err
-		})
-	case DTypeUint16:
-		return decodeJSONTypedColumn(col.Name, col.Data, func(raw json.RawMessage) (uint16, error) {
-			var v uint16
-			err := json.Unmarshal(raw, &v)
-			return v, err
-		})
-	case DTypeUint32:
-		return decodeJSONTypedColumn(col.Name, col.Data, func(raw json.RawMessage) (uint32, error) {
-			var v uint32
-			err := json.Unmarshal(raw, &v)
-			return v, err
-		})
-	case DTypeUint64:
-		return decodeJSONTypedColumn(col.Name, col.Data, func(raw json.RawMessage) (uint64, error) {
-			var v uint64
-			err := json.Unmarshal(raw, &v)
-			return v, err
-		})
-	case DTypeFloat32:
-		return decodeJSONTypedColumn(col.Name, col.Data, func(raw json.RawMessage) (float32, error) {
-			var v float32
-			err := json.Unmarshal(raw, &v)
-			return v, err
-		})
-	case DTypeFloat64:
-		return decodeJSONTypedColumn(col.Name, col.Data, func(raw json.RawMessage) (float64, error) {
-			var v float64
-			err := json.Unmarshal(raw, &v)
-			return v, err
-		})
+func normalizeJSONRows(v any) ([]map[string]any, error) {
+	switch x := v.(type) {
+	case []any:
+		rows := make([]map[string]any, 0, len(x))
+		for i := range x {
+			obj, ok := x[i].(map[string]any)
+			if !ok {
+				obj = map[string]any{"value": x[i]}
+			}
+			rows = append(rows, obj)
+		}
+		return rows, nil
+	case map[string]any:
+		if tasks, ok := x["tasks"].([]any); ok {
+			rows := make([]map[string]any, 0, len(tasks))
+			for i := range tasks {
+				obj, ok := tasks[i].(map[string]any)
+				if !ok {
+					obj = map[string]any{"value": tasks[i]}
+				}
+				rows = append(rows, obj)
+			}
+			return rows, nil
+		}
+		return []map[string]any{x}, nil
 	default:
-		return decodeJSONTypedColumn(col.Name, col.Data, func(raw json.RawMessage) (any, error) {
-			var v any
-			err := json.Unmarshal(raw, &v)
-			return v, err
-		})
+		return nil, fmt.Errorf("unsupported json root type")
 	}
 }
 
-func decodeJSONTypedColumn[T any](name string, data []json.RawMessage, parse func(json.RawMessage) (T, error)) (Series, error) {
-	values := make([]T, len(data))
-	valid := make([]uint64, (len(data)+63)/64)
-	for i, raw := range data {
-		if jsonIsNull(raw) {
-			continue
-		}
-		v, err := parse(raw)
-		if err != nil {
-			return nil, fmt.Errorf("column %q row %d: %w", name, i, err)
-		}
-		values[i] = v
-		bitSet(valid, i)
+func recordsToFrame(rows []map[string]any) (*DataFrame, error) {
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("json rows empty")
 	}
-	return &Column[T]{
-		name:  name,
-		data:  values,
-		valid: valid,
-	}, nil
-}
-
-func jsonIsNull(raw json.RawMessage) bool {
-	trimmed := bytes.TrimSpace(raw)
-	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null"))
+	keySet := make(map[string]struct{}, 64)
+	for i := range rows {
+		for k := range rows[i] {
+			keySet[k] = struct{}{}
+		}
+	}
+	keys := make([]string, 0, len(keySet))
+	for k := range keySet {
+		keys = append(keys, k)
+	}
+	cols := make([]Column, 0, len(keys))
+	nullSet := map[string]struct{}{"": {}}
+	for _, key := range keys {
+		raw := make([]string, 0, len(rows))
+		for i := range rows {
+			v, ok := rows[i][key]
+			if !ok || v == nil {
+				raw = append(raw, "")
+				continue
+			}
+			raw = append(raw, fmt.Sprint(v))
+		}
+		b := newBuilder(inferType(raw, nullSet), nullSet)
+		for i := range raw {
+			if err := b.Append(raw[i], i+1); err != nil {
+				return nil, err
+			}
+		}
+		cols = append(cols, b.Build(key))
+	}
+	return NewDataFrame(cols...)
 }

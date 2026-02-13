@@ -1,26 +1,14 @@
 # grizzly
 
-`grizzly` is a lightweight columnar dataframe-style library for Go.
+`grizzly` is a clean-slate, performance-first dataframe engine for Go with a lazy query API inspired by polars.
 
-It focuses on simple, typed columns with nullable values, sorting, filtering, and CSV/JSON encode-decode.
+## Core Design
 
-## Features
-
-- Columnar storage with generic columns
-- Nullable values via bitmap validity masks
-- Multi-key sorting with sort views
-- Row filtering and optional materialization
-- CSV read/write (inferred or schema-driven)
-- JSON marshal/unmarshal
-- Struct/interface columns with optional custom comparator
-
-## Install
-
-After setting your module path in `go.mod` (for example `github.com/you/grizzly`):
-
-```bash
-go get github.com/you/grizzly
-```
+- Typed columnar memory (`int64`, `float64`, `bool`, `utf8`) with validity bitmaps
+- Expression-based filtering (`Col("x").Gt(...)`, `Col("id").Even()`) instead of row callbacks
+- Lazy query plans with simple optimization (filter push-up)
+- Deterministic projection checksums for correctness verification
+- CSV + JSON scanners as pluggable sources
 
 ## Quick Example
 
@@ -28,28 +16,31 @@ go get github.com/you/grizzly
 package main
 
 import (
-    "fmt"
+	"fmt"
 
-    "github.com/you/grizzly"
+	"grizzly"
 )
 
 func main() {
-    id := grizzly.NewColumn("id", []int{3, 1, 2})
-    name := grizzly.NewColumn("name", []string{"zoe", "amy", "bob"})
+	df, err := grizzly.
+		ScanCSV("data/customers-500000.csv", grizzly.ScanOptions{}).
+		Filter(grizzly.Col("Index").Even()).
+		Sort("Customer Id", false).
+		Select("Index", "Customer Id", "Email").
+		Collect()
+	if err != nil {
+		panic(err)
+	}
 
-    df, err := grizzly.NewFrame(id, name)
-    if err != nil {
-        panic(err)
-    }
-
-    _ = df.SortBy(grizzly.SortKey{Name: "name"})
-    fmt.Print(df.Head(3))
+	fmt.Println("rows", df.Height(), "checksum", df.ProjectionChecksum(3))
 }
 ```
 
-## Development
+## Direction
 
-```bash
-go test ./...
-go test . -run '^$' -bench . -benchmem
-```
+This version intentionally drops legacy API compatibility to focus on a high-performance architecture and provide a strong foundation for:
+
+- chunked columns
+- parallel scan/filter/sort kernels
+- expression fusion and predicate pushdown
+- SIMD-oriented execution paths
